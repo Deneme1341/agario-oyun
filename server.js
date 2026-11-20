@@ -11,16 +11,17 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-const MAP_SIZE = 4000; // Büyük 6x6 (A1 - F6) Harita
+const MAP_SIZE = 4000;
 const FOOD_COUNT = 450;
 const VIRUS_COUNT = 25;
 const VIRUS_RADIUS = 55;
 const MAX_CELLS = 16;
+const ROOM_DURATION = 3600 * 1000; // 1 Saat (milisaniye cinsinden)
 
 const rooms = {
-  'Oda 1 (FFA - Serbest)': { players: {}, foods: [], viruses: [], ejected: [] },
-  'Oda 2 (Hızlı Arena)': { players: {}, foods: [], viruses: [], ejected: [] },
-  'Oda 3 (Pro Meydanı)': { players: {}, foods: [], viruses: [], ejected: [] }
+  'Oda 1 (FFA - Serbest)': { players: {}, foods: [], viruses: [], ejected: [], endTime: Date.now() + ROOM_DURATION, lastWinner: 'Henüz kazanan yok' },
+  'Oda 2 (Hızlı Arena)': { players: {}, foods: [], viruses: [], ejected: [], endTime: Date.now() + ROOM_DURATION, lastWinner: 'Henüz kazanan yok' },
+  'Oda 3 (Pro Meydanı)': { players: {}, foods: [], viruses: [], ejected: [], endTime: Date.now() + ROOM_DURATION, lastWinner: 'Henüz kazanan yok' }
 };
 
 function randomColor() {
@@ -46,7 +47,31 @@ function spawnVirus() {
   };
 }
 
-// Odaları doldur
+function resetRoom(roomName) {
+  const room = rooms[roomName];
+  // En büyük oyuncuyu son kazanan olarak kaydet
+  let topPlayer = 'Yok';
+  let maxScore = 0;
+  for (let id in room.players) {
+    let p = room.players[id];
+    let score = p.cells.reduce((sum, c) => sum + Math.floor(c.radius), 0);
+    if (score > maxScore) {
+      maxScore = score;
+      topPlayer = `${p.name} (${maxScore} Puan)`;
+    }
+  }
+  room.lastWinner = topPlayer;
+  room.players = {};
+  room.foods = [];
+  room.viruses = [];
+  room.ejected = [];
+  room.endTime = Date.now() + ROOM_DURATION;
+
+  for (let i = 0; i < FOOD_COUNT; i++) room.foods.push(spawnFood());
+  for (let i = 0; i < VIRUS_COUNT; i++) room.viruses.push(spawnVirus());
+  io.emit('roomList', getRoomData());
+}
+
 for (let roomName in rooms) {
   for (let i = 0; i < FOOD_COUNT; i++) rooms[roomName].foods.push(spawnFood());
   for (let i = 0; i < VIRUS_COUNT; i++) rooms[roomName].viruses.push(spawnVirus());
@@ -54,8 +79,7 @@ for (let roomName in rooms) {
 
 io.on('connection', (socket) => {
   let currentRoom = null;
-
-  socket.emit('roomList', getRoomCounts());
+  socket.emit('roomList', getRoomData());
 
   socket.on('joinRoom', ({ name, room }) => {
     if (!rooms[room]) return;
@@ -68,20 +92,17 @@ io.on('connection', (socket) => {
       color: randomColor(),
       targetX: 0,
       targetY: 0,
-      cells: [
-        {
-          id: Math.random().toString(36).substr(2, 9),
-          x: 200 + Math.random() * (MAP_SIZE - 400),
-          y: 200 + Math.random() * (MAP_SIZE - 400),
-          radius: 32,
-          vx: 0,
-          vy: 0,
-          mergeTime: 0
-        }
-      ]
+      cells: [{
+        id: Math.random().toString(36).substr(2, 9),
+        x: 200 + Math.random() * (MAP_SIZE - 400),
+        y: 200 + Math.random() * (MAP_SIZE - 400),
+        radius: 32,
+        vx: 0,
+        vy: 0,
+        mergeTime: 0
+      }]
     };
-
-    io.emit('roomList', getRoomCounts());
+    io.emit('roomList', getRoomData());
   });
 
   socket.on('mouseMove', (target) => {
@@ -91,7 +112,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // SPACE TUŞU: BÖLÜNME
   socket.on('split', () => {
     if (!currentRoom || !rooms[currentRoom]?.players[socket.id]) return;
     const p = rooms[currentRoom].players[socket.id];
@@ -100,11 +120,9 @@ io.on('connection', (socket) => {
 
     p.cells.forEach(cell => {
       if (cell.radius >= 42 && (p.cells.length + newCells.length) < MAX_CELLS) {
-        // Kütleyi ikiye böl (Alan korunumu: r / sqrt(2))
         const newRadius = cell.radius / Math.SQRT2;
         cell.radius = newRadius;
-        cell.mergeTime = Date.now() + 12000; // 12 saniye sonra tekrar birleşebilir
-
+        cell.mergeTime = Date.now() + 12000;
         newCells.push({
           id: Math.random().toString(36).substr(2, 9),
           x: cell.x + Math.cos(angle) * (newRadius * 1.5),
@@ -116,11 +134,9 @@ io.on('connection', (socket) => {
         });
       }
     });
-
     p.cells.push(...newCells);
   });
 
-  // E veya W TUŞU: YEM ATMA / BESLEME
   socket.on('eject', () => {
     if (!currentRoom || !rooms[currentRoom]?.players[socket.id]) return;
     const room = rooms[currentRoom];
@@ -146,49 +162,50 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     if (currentRoom && rooms[currentRoom]) {
       delete rooms[currentRoom].players[socket.id];
-      io.emit('roomList', getRoomCounts());
+      io.emit('roomList', getRoomData());
     }
   });
 });
 
-function getRoomCounts() {
-  const counts = {};
-  for (let r in rooms) counts[r] = Object.keys(rooms[r].players).length;
-  return counts;
+function getRoomData() {
+  const data = {};
+  const now = Date.now();
+  for (let r in rooms) {
+    data[r] = {
+      count: Object.keys(rooms[r].players).length,
+      timeLeft: Math.max(0, rooms[r].endTime - now),
+      lastWinner: rooms[r].lastWinner
+    };
+  }
+  return data;
 }
 
-// Ana Oyun Fiziği Döngüsü (Saniyede 30 Kare)
 setInterval(() => {
   const now = Date.now();
 
   for (let roomName in rooms) {
     const room = rooms[roomName];
+    if (now >= room.endTime) {
+      resetRoom(roomName);
+      continue;
+    }
+
     const players = room.players;
 
-    // Atılan yemlerin (E/W) hareketi
     for (let i = room.ejected.length - 1; i >= 0; i--) {
       let ej = room.ejected[i];
-      ej.x += ej.vx;
-      ej.y += ej.vy;
-      ej.vx *= 0.88;
-      ej.vy *= 0.88;
-      ej.x = Math.max(10, Math.min(MAP_SIZE - 10, ej.x));
-      ej.y = Math.max(10, Math.min(MAP_SIZE - 10, ej.y));
+      ej.x += ej.vx; ej.y += ej.vy;
+      ej.vx *= 0.88; ej.vy *= 0.88;
     }
 
     for (let id in players) {
       let p = players[id];
-
-      // Oyuncunun merkezini bul (çoklu hücrede fare yönü için)
       let centerX = 0, centerY = 0;
       p.cells.forEach(c => { centerX += c.x; centerY += c.y; });
-      centerX /= p.cells.length;
-      centerY /= p.cells.length;
+      centerX /= p.cells.length; centerY /= p.cells.length;
 
       for (let i = 0; i < p.cells.length; i++) {
         let cell = p.cells[i];
-
-        // Fareye doğru hareket
         let dx = (centerX + p.targetX) - cell.x;
         let dy = (centerY + p.targetY) - cell.y;
         let angle = Math.atan2(dy, dx);
@@ -196,29 +213,20 @@ setInterval(() => {
 
         cell.x += Math.cos(angle) * speed + cell.vx;
         cell.y += Math.sin(angle) * speed + cell.vy;
-        cell.vx *= 0.85;
-        cell.vy *= 0.85;
-
-        // Harita sınırları
+        cell.vx *= 0.85; cell.vy *= 0.85;
         cell.x = Math.max(cell.radius, Math.min(MAP_SIZE - cell.radius, cell.x));
         cell.y = Math.max(cell.radius, Math.min(MAP_SIZE - cell.radius, cell.y));
 
-        // Kendi hücreleri arası çarpışma ve birleşme
         for (let j = i + 1; j < p.cells.length; j++) {
           let otherCell = p.cells[j];
           let dist = Math.hypot(cell.x - otherCell.x, cell.y - otherCell.y);
           let minDist = cell.radius + otherCell.radius;
-
           if (now > cell.mergeTime && now > otherCell.mergeTime) {
-            // Birleşme zamanı geldiyse yut
             if (dist < Math.max(cell.radius, otherCell.radius) * 0.8) {
               cell.radius = Math.hypot(cell.radius, otherCell.radius);
-              p.cells.splice(j, 1);
-              j--;
-              continue;
+              p.cells.splice(j, 1); j--; continue;
             }
           } else if (dist < minDist && dist > 0) {
-            // Birleşme süresi dolmadıysa birbirini ittir
             let overlap = (minDist - dist) / 2;
             let pushAngle = Math.atan2(otherCell.y - cell.y, otherCell.x - cell.x);
             cell.x -= Math.cos(pushAngle) * overlap * 0.5;
@@ -228,7 +236,6 @@ setInterval(() => {
           }
         }
 
-        // 1. Normal Yem Yeme
         for (let fIdx = room.foods.length - 1; fIdx >= 0; fIdx--) {
           let f = room.foods[fIdx];
           if (Math.hypot(cell.x - f.x, cell.y - f.y) < cell.radius) {
@@ -237,7 +244,6 @@ setInterval(() => {
           }
         }
 
-        // 2. Atılan Yemleri (E/W) Yeme
         for (let eIdx = room.ejected.length - 1; eIdx >= 0; eIdx--) {
           let ej = room.ejected[eIdx];
           if (Math.hypot(cell.x - ej.x, cell.y - ej.y) < cell.radius) {
@@ -246,23 +252,16 @@ setInterval(() => {
           }
         }
 
-        // 3. YEŞİL DİKEN (VİRÜS) PATLATMA MANTIĞI
         for (let vIdx = room.viruses.length - 1; vIdx >= 0; vIdx--) {
           let v = room.viruses[vIdx];
-          let dist = Math.hypot(cell.x - v.x, cell.y - v.y);
-
-          // Oyuncu dikenden büyükse ve üzerine geldiyse PATLA!
-          if (dist < cell.radius && cell.radius > v.radius * 1.1) {
-            room.viruses[vIdx] = spawnVirus(); // Yeni diken doğsun
-            cell.radius += 10; // Diken kütlesini al
-
-            // Parçalara bölün (Maksimum hücre sınırına kadar)
+          if (Math.hypot(cell.x - v.x, cell.y - v.y) < cell.radius && cell.radius > v.radius * 1.1) {
+            room.viruses[vIdx] = spawnVirus();
+            cell.radius += 10;
             let pieces = Math.min(8, MAX_CELLS - p.cells.length);
             if (pieces > 0) {
               let subRadius = Math.max(24, cell.radius / Math.sqrt(pieces + 1));
               cell.radius = subRadius;
               cell.mergeTime = now + 15000;
-
               for (let k = 0; k < pieces; k++) {
                 let burstAngle = (Math.PI * 2 / pieces) * k;
                 p.cells.push({
@@ -282,34 +281,27 @@ setInterval(() => {
       }
     }
 
-    // 4. Oyuncuların Birbirini Yemesi
     const playerIds = Object.keys(players);
     for (let i = 0; i < playerIds.length; i++) {
       let p1 = players[playerIds[i]];
       if (!p1) continue;
-
       for (let j = 0; j < playerIds.length; j++) {
         if (i === j) continue;
         let p2 = players[playerIds[j]];
         if (!p2) continue;
-
         for (let c1 of p1.cells) {
           for (let c2Idx = p2.cells.length - 1; c2Idx >= 0; c2Idx--) {
             let c2 = p2.cells[c2Idx];
-            let dist = Math.hypot(c1.x - c2.x, c1.y - c2.y);
-
-            if (dist < c1.radius - (c2.radius * 0.3) && c1.radius > c2.radius * 1.15) {
+            if (Math.hypot(c1.x - c2.x, c1.y - c2.y) < c1.radius - (c2.radius * 0.3) && c1.radius > c2.radius * 1.15) {
               c1.radius = Math.hypot(c1.radius, c2.radius);
               p2.cells.splice(c2Idx, 1);
             }
           }
         }
-
-        // Eğer p2'nin hiç hücresi kalmadıysa elendi
         if (p2.cells.length === 0) {
           io.to(p2.id).emit('eaten');
           delete players[p2.id];
-          io.emit('roomList', getRoomCounts());
+          io.emit('roomList', getRoomData());
         }
       }
     }
@@ -325,5 +317,5 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Oyun sunucusu aktif: http://localhost:${PORT}`);
+  console.log(`Oyun aktif: http://localhost:${PORT}`);
 });
